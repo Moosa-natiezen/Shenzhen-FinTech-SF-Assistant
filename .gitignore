@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+# drizzle/meta must be committed: drizzle-kit migrate reads meta/_journal.json
