@@ -17,7 +17,7 @@ import {
 } from "./permissions";
 
 export class ApiError extends Error {
-  constructor(public readonly status: 401 | 403, message: string) {
+  constructor(public readonly status: 400 | 401 | 403, message: string) {
     super(message);
     this.name = "ApiError";
   }

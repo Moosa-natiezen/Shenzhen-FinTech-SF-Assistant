@@ -200,3 +200,67 @@ describe("transport & origin hardening", () => {
     expect(res.headers.get("access-control-allow-credentials")).toBe("true");
   });
 });
+
+describe("Phase-2 money endpoints: RBAC + server-side FX (I-4)", () => {
+  const json = (body: unknown) => ({
+    method: "POST" as const,
+    headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+    body: JSON.stringify(body),
+  });
+
+  it("student tier is denied sponsor deposits (403, requires funding:deposit)", async () => {
+    const { cookies } = await signIn("alice@students.example.com");
+    const res = await app.request("/api/funding/deposit", { ...json({ walletId: "w-alice-cny", amount: "10" }), headers: { ...json({}).headers, cookie: cookies } });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/funding:deposit/);
+  });
+
+  it("sponsor tier is denied FX conversions (403, requires fx:convert)", async () => {
+    const { cookies } = await signIn("parent@family.example.com");
+    const res = await app.request("/api/fx/convert", { ...json({ homeWalletId: "x", hostWalletId: "y", amountBase: "1", rateLockId: "z" }), headers: { ...json({}).headers, cookie: cookies } });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/fx:convert/);
+  });
+
+  it("fx/rate returns a server-priced lock and rejects malformed amounts (400)", async () => {
+    const { cookies } = await signIn("alice@students.example.com");
+    const ok = await app.request("/api/fx/rate", { ...json({ baseCurrency: "CNY", quoteCurrency: "GBP", amountBase: "100" }), headers: { ...json({}).headers, cookie: cookies } });
+    expect(ok.status).toBe(200);
+    const { lock } = (await ok.json()) as { lock: { fxFinal: string; fxSpot: string } };
+    // Server computes 0.11 * 1.002 = 0.11022 — no client rate involved.
+    expect(lock.fxSpot).toBe("0.11");
+    expect(lock.fxFinal).toBe("0.11022000");
+
+    // A number (float) amount is rejected outright (I-10 exactness).
+    const bad = await app.request("/api/fx/rate", { ...json({ baseCurrency: "CNY", quoteCurrency: "GBP", amountBase: 100.5 }), headers: { ...json({}).headers, cookie: cookies } });
+    expect(bad.status).toBe(400);
+  });
+
+  it("fx/convert ignores any client-supplied rate and uses the locked server rate", async () => {
+    const { cookies } = await signIn("alice@students.example.com");
+    const rateRes = await app.request("/api/fx/rate", { ...json({ baseCurrency: "CNY", quoteCurrency: "GBP", amountBase: "100", feeFlat: "0" }), headers: { ...json({}).headers, cookie: cookies } });
+    const { lock } = (await rateRes.json()) as { lock: { id: string } };
+
+    const before = await app.request("/api/wallets", { headers: { cookie: cookies, origin: "http://localhost:3000" } });
+    const beforeBody = (await before.json()) as { wallets: Array<{ id: string; balance: string }> };
+    const gbpBefore = beforeBody.wallets.find((w) => w.id === "w-alice-gbp")!.balance;
+
+    // Send bogus client rates; the server must use the locked 0.11022.
+    const res = await app.request("/api/fx/convert", {
+      ...json({ homeWalletId: "w-alice-cny", hostWalletId: "w-alice-gbp", amountBase: "100", rateLockId: lock.id, fxFinal: "999", fxSpot: "999", rate: "999" }),
+      headers: { ...json({}).headers, cookie: cookies },
+    });
+    expect(res.status).toBe(200);
+    const { conversion } = (await res.json()) as { conversion: { hostCredited: string; fxFinal: string } };
+    expect(conversion.fxFinal).toBe("0.11022000");
+    expect(conversion.hostCredited).toBe("11.02200000"); // 100 * 0.11022, NOT 999
+    expect(conversion.hostCredited).not.toBe("999");
+
+    const after = await app.request("/api/wallets", { headers: { cookie: cookies, origin: "http://localhost:3000" } });
+    const afterBody = (await after.json()) as { wallets: Array<{ id: string; balance: string }> };
+    const gbpAfter = afterBody.wallets.find((w) => w.id === "w-alice-gbp")!.balance;
+    expect(parseFloat(gbpAfter) - parseFloat(gbpBefore)).toBeCloseTo(11.022, 6);
+  });
+});

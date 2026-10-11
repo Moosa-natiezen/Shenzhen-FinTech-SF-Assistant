@@ -84,7 +84,13 @@ describe("RLS on wallets (I-1)", () => {
     const rows = await withUserContext(db, { userId: "inspector", role: "compliance_admin" }, (tx) =>
       tx.select().from(wallets),
     );
-    expect(rows).toHaveLength(3);
+    // Sees wallets across owners (alice + bob); the exact total also includes
+    // the platform's seeded system wallets from the Phase-2 migration.
+    const ids = rows.map((r) => r.id);
+    for (const expected of ["w-alice-cny", "w-alice-gbp", "w-bob-cny"]) {
+      expect(ids).toContain(expected);
+    }
+    expect(rows.length).toBeGreaterThanOrEqual(3);
   });
   it("INSERT with a foreign user_id is rejected by WITH CHECK", async () => {
     await expect(

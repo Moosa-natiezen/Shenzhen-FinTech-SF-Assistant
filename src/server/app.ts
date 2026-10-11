@@ -14,8 +14,12 @@ import type { AnyPgDatabase } from "../db/types";
 import { withUserContext } from "../db/rls";
 import { auditLog, wallets } from "../db/schema";
 import { verifyAuditChain } from "../security/audit";
-import { ApiError, isAdminTier, requireMfaEnrolled, requirePermission } from "../security/guards";
+import { ApiError, isAdminTier, requireFreshAuth, requireMfaEnrolled, requirePermission } from "../security/guards";
 import { getSessionOrThrow } from "../security/session";
+import { LedgerError } from "../ledger/engine";
+import { lockRate } from "../fx/service";
+import { convertFunds } from "../ledger/conversion";
+import { depositFunds, transferFunds, isFirstTransferToRecipient } from "../transfers/service";
 
 export interface AppDeps {
   auth: Auth;
@@ -82,9 +86,119 @@ export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
     return c.json({ chainVerified: true, entries: rows });
   });
 
+
+  // ---------------------------------------------------------------------------
+  // Phase-2: Multi-currency wallet & ledger engine (T7-T10).
+  // Money amounts are exact decimal STRINGS end-to-end (invariant I-10) — the
+  // gateway rejects numbers so a float can never reach the ledger. Rates are
+  // always server-computed; the convert endpoint takes a rate LOCK id, never a
+  // rate value (invariant I-4).
+  // ---------------------------------------------------------------------------
+
+  const DECIMAL = /^\d+(\.\d{1,8})?$/;
+  /** Validates a positive decimal-string money field (throws 400 otherwise). */
+  function amount(value: unknown, field: string): string {
+    if (typeof value !== "string" || !DECIMAL.test(value) || parseFloat(value) <= 0) {
+      throw new ApiError(400, `Invalid ${field}: expected a positive decimal string`);
+    }
+    return value;
+  }
+  /** Validates an optional non-negative decimal-string money field. */
+  function optionalAmount(value: unknown, field: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== "string" || !DECIMAL.test(value)) {
+      throw new ApiError(400, `Invalid ${field}: expected a non-negative decimal string`);
+    }
+    return value;
+  }
+  function required(value: unknown, field: string): string {
+    if (typeof value !== "string" || !value) throw new ApiError(400, `Missing ${field}`);
+    return value;
+  }
+
+  // Step-up policy for sensitive money movement (design doc Risk 4).
+  const STEP_UP_WINDOW_SECONDS = 300;
+  const LARGE_TRANSFER_THRESHOLD = "1000";
+
+  // T8: server-priced FX quote (rate lock). Requires fx:convert (student tier).
+  app.post("/api/fx/rate", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "fx", "convert");
+    const body = await c.req.json();
+    const lock = await lockRate(db, {
+      userId: ctx.session.user.id,
+      baseCurrency: required(body.baseCurrency, "baseCurrency"),
+      quoteCurrency: required(body.quoteCurrency, "quoteCurrency"),
+      amountBase: amount(body.amountBase, "amountBase"),
+      feeFlat: optionalAmount(body.feeFlat, "feeFlat"),
+    });
+    return c.json({ lock });
+  });
+
+  // T9: execute a conversion against a live server-side lock.
+  app.post("/api/fx/convert", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "fx", "convert");
+    const body = await c.req.json();
+    const result = await convertFunds(db, {
+      userId: ctx.session.user.id,
+      homeWalletId: required(body.homeWalletId, "homeWalletId"),
+      hostWalletId: required(body.hostWalletId, "hostWalletId"),
+      amountBase: amount(body.amountBase, "amountBase"),
+      rateLockId: required(body.rateLockId, "rateLockId"),
+      feeFlat: optionalAmount(body.feeFlat, "feeFlat"),
+    });
+    return c.json({ conversion: result });
+  });
+
+  // T10: sponsor deposit (funding:deposit).
+  app.post("/api/funding/deposit", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "funding", "deposit");
+    const body = await c.req.json();
+    const result = await depositFunds(db, {
+      sponsorUserId: ctx.session.user.id,
+      walletId: required(body.walletId, "walletId"),
+      amount: amount(body.amount, "amount"),
+    });
+    return c.json({ deposit: result });
+  });
+
+  // T10: sponsor -> recipient transfer (funding:transfer) with step-up for
+  // new payout targets and large transfers.
+  app.post("/api/funding/transfer", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "funding", "transfer");
+    const body = await c.req.json();
+    const recipientUserId = required(body.recipientUserId, "recipientUserId");
+    const amountFrom = amount(body.amountFrom, "amountFrom");
+
+    const isNewTarget = await isFirstTransferToRecipient(db, ctx.session.user.id, recipientUserId);
+    const isLarge = parseFloat(amountFrom) >= parseFloat(LARGE_TRANSFER_THRESHOLD);
+    if (isNewTarget || isLarge) {
+      requireFreshAuth(ctx.session.session, STEP_UP_WINDOW_SECONDS);
+    }
+
+    const result = await transferFunds(db, {
+      senderUserId: ctx.session.user.id,
+      recipientUserId,
+      fromWalletId: required(body.fromWalletId, "fromWalletId"),
+      toWalletId: required(body.toWalletId, "toWalletId"),
+      amountFrom,
+      rateLockId: body.rateLockId ? required(body.rateLockId, "rateLockId") : undefined,
+      feeFlat: optionalAmount(body.feeFlat, "feeFlat"),
+    });
+    return c.json({ transfer: result });
+  });
+
   app.onError((err, c) => {
     if (err instanceof ApiError) {
       return c.json({ error: err.message }, err.status);
+    }
+    if (err instanceof LedgerError) {
+      // Ledger/business-rule rejections (insufficient funds, caps, screening,
+      // bad lock, unbalanced) are client-correctable: surface as 400 with code.
+      return c.json({ error: err.message, code: err.code }, 400);
     }
     console.error("unhandled error", err);
     return c.json({ error: "Internal server error" }, 500);

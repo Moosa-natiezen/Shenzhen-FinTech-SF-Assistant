@@ -16,7 +16,21 @@
 import { sql } from "drizzle-orm";
 import type { AnyPgDatabase } from "./types";
 
-const APP_TABLES = ["user", "session", "account", "verification", "two_factor", "wallets", "audit_log"];
+const APP_TABLES = [
+  "user",
+  "session",
+  "account",
+  "verification",
+  "two_factor",
+  "wallets",
+  "audit_log",
+  // Phase-2 ledger engine: FORCE-RLS + append-only tables. Ownership must
+  // transfer to the app role so RLS binds exactly as it does on Neon.
+  "ledger_entries",
+  "balance_snapshots",
+  "rate_locks",
+  "transfers",
+];
 
 export async function asAppRole(db: AnyPgDatabase, roleName = "sf_app"): Promise<void> {
   if (!/^[a-z_][a-z0-9_]*$/.test(roleName)) {

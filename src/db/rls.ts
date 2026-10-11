@@ -48,3 +48,45 @@ export async function withUserContext<T>(
     return fn(tx);
   });
 }
+
+/**
+ * The synthetic platform owner for external/system clearing accounts (I-11).
+ * `system` owns one per-currency wallet representing money coming from / going
+ * to the outside world (deposits, FX). Seeded by migration 0003.
+ */
+export const SYSTEM_USER_ID = "system";
+export const SYSTEM_CTX: RlsContext = { userId: SYSTEM_USER_ID, role: "student" };
+
+/**
+ * Binds an RLS context onto a live transaction by setting the `app.*` GUCs
+ * transaction-locally (is_local=true => cleared only at COMMIT/ROLLBACK, so it
+ * survives across statements inside the tx but never leaks between transactions).
+ *
+ * This is the key that lets one DB transaction post legs owned by *different*
+ * users while FORCE-RLS stays fully enabled: we re-bind before each owner's
+ * write instead of weakening any policy.
+ */
+export async function bindContext(
+  tx: AnyPgDatabase,
+  ctx: RlsContext
+): Promise<void> {
+  await tx.execute(sql`select set_config('app.user_id', ${ctx.userId}, true)`);
+  await tx.execute(sql`select set_config(${USER_ROLE_KEY}, ${ctx.role}, true)`);
+}
+
+/**
+ * Runs `fn` inside a transaction, handing it a `bind(ctx)` callback to switch
+ * the bound owner context as the work proceeds. The first operation inside the
+ * callback must be a `bind` for the actor; re-bind before writing for any other
+ * owner (system / student). Atomicity (I-3): everything commits or rolls back
+ * as one unit.
+ */
+export async function withContextSwitching<T>(
+  db: any,
+  fn: (tx: AnyPgDatabase, bind: (ctx: RlsContext) => Promise<void>) => Promise<T>
+): Promise<T> {
+  return db.transaction(async (tx: AnyPgDatabase) => {
+    const bind = (ctx: RlsContext) => bindContext(tx, ctx);
+    return fn(tx, bind);
+  });
+}
