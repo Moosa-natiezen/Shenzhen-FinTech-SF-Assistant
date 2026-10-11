@@ -15,6 +15,8 @@ process.env.BETTER_AUTH_SECRET = "test-secret-".repeat(5);
 process.env.BETTER_AUTH_URL = "http://localhost:3000";
 process.env.ALLOWED_ORIGINS = "http://localhost:3000";
 process.env.BOOTSTRAP_ADMIN_EMAILS = "boss@example.com";
+process.env.SPII_MASTER_KEY = "test-spii-master-key-".repeat(3); // KMS stand-in for the export enclave
+process.env.SPII_KEY_ID = "k1";
 
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
@@ -27,6 +29,8 @@ import { user, wallets } from "../src/db/schema";
 import { eq } from "drizzle-orm";
 import { resetEnvCache } from "../src/config/env";
 import { asAppRole } from "../src/db/pglite-dev-role";
+import { creditProfiles, rScoreSnapshots } from "../src/db/schema";
+import { encryptSpii, loadKeyringFromEnv } from "../src/security/spii";
 
 resetEnvCache();
 
@@ -35,6 +39,9 @@ type Db = ReturnType<typeof drizzle<typeof schema>>;
 
 let db: Db;
 let app: ReturnType<typeof buildApp>;
+// Captured BEFORE boss's MFA is enabled (a fresh sign-in after MFA triggers a
+// 2FA challenge, not a session); the pre-MFA session still passes MFA guards.
+let bossCookies = "";
 
 function collectCookies(res: Response): string {
   return res.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
@@ -146,8 +153,6 @@ describe("Access Control Matrix via HTTP", () => {
     const res = await app.request("/api/wallets", { headers: { cookie: cookies, origin: "http://localhost:3000" } });
     expect(res.status).toBe(403);
   });
-
-  let bossCookies = "";
 
   it("compliance tier is denied the admin audit route without MFA enrollment (I-7)", async () => {
     const { cookies } = await signIn("boss@example.com");
@@ -262,5 +267,66 @@ describe("Phase-2 money endpoints: RBAC + server-side FX (I-4)", () => {
     const afterBody = (await after.json()) as { wallets: Array<{ id: string; balance: string }> };
     const gbpAfter = afterBody.wallets.find((w) => w.id === "w-alice-gbp")!.balance;
     expect(parseFloat(gbpAfter) - parseFloat(gbpBefore)).toBeCloseTo(11.022, 6);
+  });
+});
+
+describe("Phase-3 money/credit endpoints: RBAC + MFA + no-plaintext SPII", () => {
+  const json = (body: unknown) => ({
+    method: "POST" as const,
+    headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+    body: JSON.stringify(body),
+  });
+
+  it("student tier is denied Metro-2 exports (403, requires credit:exportMetro2)", async () => {
+    const { cookies } = await signIn("alice@students.example.com");
+    const res = await app.request("/api/admin/metro2/export", { ...json({ studentUserId: "x" }), headers: { ...json({}).headers, cookie: cookies } });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/credit:exportMetro2/);
+  });
+
+  it("sponsor tier is denied tuition payments (403, requires tuition:pay)", async () => {
+    const { cookies } = await signIn("parent@family.example.com");
+    const res = await app.request("/api/tuition/pay", { ...json({ universityId: "u", walletId: "w", amount: "1" }), headers: { ...json({}).headers, cookie: cookies } });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/tuition:pay/);
+  });
+
+  it("student can list the verified university directory", async () => {
+    const { cookies } = await signIn("alice@students.example.com");
+    const res = await app.request("/api/universities", { headers: { cookie: cookies, origin: "http://localhost:3000" } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { universities: Array<{ id: string; verified: boolean }> };
+    expect(body.universities.every((u) => u.verified)).toBe(true);
+    expect(body.universities.map((u) => u.id)).not.toContain("uni-unverified-test");
+  });
+
+  it("compliance (MFA) exports Metro-2 with NO plaintext SPII; enclave decrypts but output is tokenized", async () => {
+    // Seed alice's encrypted SPII + a score so there is something to export.
+    const [aliceRow] = await db.select().from(user).where(eq(user.email, "alice@students.example.com"));
+    const aliceId = aliceRow!.id;
+    const ring = loadKeyringFromEnv();
+    const PLAINTEXT = "PASS-99887766";
+    const ciphertext = encryptSpii(PLAINTEXT, ring, { column: "credit_profiles.national_id_spii", owner: aliceId });
+    await withUserContext(db, { userId: aliceId, role: "student" }, (tx) =>
+      tx.insert(creditProfiles).values({ studentUserId: aliceId, nationalIdSpii: ciphertext }).onConflictDoNothing(),
+    );
+    await withUserContext(db, { userId: aliceId, role: "student" }, (tx) =>
+      tx.insert(rScoreSnapshots).values({ id: `seed-${aliceId}`, studentUserId: aliceId, score: 700, tTuition: "1", bBills: "0", sWallet: "0.5", lRepay: "0", triggerEvent: "seed" }).onConflictDoNothing(),
+    );
+
+    // boss@example.com is compliance_admin and MFA-enrolled (Phase-1 suite). A
+    // fresh password sign-in would trigger a 2FA challenge, so reuse the
+    // pre-MFA session cookie, which still satisfies the MFA-enrollment guard.
+    const res = await app.request("/api/admin/metro2/export", { ...json({ studentUserId: aliceId }), headers: { ...json({}).headers, cookie: bossCookies } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { export: { records: Array<{ accountNumber: string; paymentRating: string }> } };
+    expect(body.export.records).toHaveLength(1);
+    expect(body.export.records[0]!.accountNumber).toMatch(/^[0-9a-f]{16}$/);
+    // The plaintext SPII must never appear in the HTTP response body.
+    const raw = JSON.stringify(body);
+    expect(raw).not.toContain(PLAINTEXT);
+    expect(raw).not.toContain(ciphertext);
   });
 });

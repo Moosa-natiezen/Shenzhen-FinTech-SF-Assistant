@@ -38,10 +38,10 @@ audit trail covers the new state changes.
 
 ## Phase 2 — Multi-Currency Wallet & Ledger Engine
 
-- [ ] **T7. Double-entry ledger schema.** `ledger_entries` (append-only, signed BIGINT minor units per currency), `balance_snapshots`; RLS + immutability triggers; account state derived from entries. *(I-3, I-6, I-10)*
-- [ ] **T8. FX rate service.** Provider-agnostic spot-rate fetch; `FX_final = FX_spot × (1 + θ_margin)`; rate-lock table with 30-second expiry bound to user + amount + pair; client rates ignored; audit every lock. *(I-4, I-6)*
-- [ ] **T9. Atomic conversion executor.** `BEGIN` → lock home row `FOR UPDATE` → verify `B_home ≥ A_home + F_flat` → debit home, credit host `(A_home − F_flat) × FX_final`, append ledger entries + audit → `COMMIT`; rollback on any failure; concurrency test (N parallel conversions, exactly one wins per balance). *(I-3, I-4, I-10)*
-- [ ] **T10. Sponsor funding & cross-border transfers.** Deposit endpoints (sponsor tier only); sanctions/PEP screening hook (block-on-miss); per-transaction and daily velocity caps + cumulative transfer caps at the gateway; step-up auth for new payout targets and large transfers. *(I-7, I-8)*
+- [x] **T7. Double-entry ledger schema.** `ledger_entries` (append-only, signed BIGINT minor units per currency), `balance_snapshots`; RLS + immutability triggers; account state derived from entries. *(I-3, I-6, I-10)*
+- [x] **T8. FX rate service.** Provider-agnostic spot-rate fetch; `FX_final = FX_spot × (1 + θ_margin)`; rate-lock table with 30-second expiry bound to user + amount + pair; client rates ignored; audit every lock. *(I-4, I-6)*
+- [x] **T9. Atomic conversion executor.** `BEGIN` → lock home row `FOR UPDATE` → verify `B_home ≥ A_home + F_flat` → debit home, credit host `(A_home − F_flat) × FX_final`, append ledger entries + audit → `COMMIT`; rollback on any failure; concurrency test (N parallel conversions, exactly one wins per balance). *(I-3, I-4, I-10)*
+- [x] **T10. Sponsor funding & cross-border transfers.** Deposit endpoints (sponsor tier only); sanctions/PEP screening hook (block-on-miss); per-transaction and daily velocity caps + cumulative transfer caps at the gateway; step-up auth for new payout targets and large transfers. *(I-7, I-8)*
 
 ## Phase 3 — Tuition Routing & Credit Engine
 

@@ -20,6 +20,11 @@ import { LedgerError } from "../ledger/engine";
 import { lockRate } from "../fx/service";
 import { convertFunds } from "../ledger/conversion";
 import { depositFunds, transferFunds, isFirstTransferToRecipient } from "../transfers/service";
+import { listUniversities, payTuition, listReceipts, TuitionError } from "../tuition/service";
+import { getLatestScore } from "../credit/rscore";
+import { generateMetro2Export } from "../reporting/metro2";
+import { loadKeyringFromEnv } from "../security/spii";
+import { can } from "../security/guards";
 
 export interface AppDeps {
   auth: Auth;
@@ -191,6 +196,69 @@ export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
     return c.json({ transfer: result });
   });
 
+
+  // ---------------------------------------------------------------------------
+  // Phase-3: Tuition routing & credit engine (T11-T13).
+  // ---------------------------------------------------------------------------
+
+  // T11: verified-institution directory (student tier).
+  app.get("/api/universities", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "tuition", "pay");
+    const unis = await listUniversities(db);
+    return c.json({ universities: unis });
+  });
+
+  // T11: student initiates a tuition payment to a verified institution.
+  app.post("/api/tuition/pay", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "tuition", "pay");
+    const body = await c.req.json();
+    const receipt = await payTuition(db, {
+      studentUserId: ctx.session.user.id,
+      universityId: required(body.universityId, "universityId"),
+      walletId: required(body.walletId, "walletId"),
+      amount: amount(body.amount, "amount"),
+    });
+    return c.json({ receipt });
+  });
+
+  // T11: receipts — student sees own, sponsor sees linked students (read-only,
+  // RLS-scoped), compliance sees all.
+  app.get("/api/tuition/receipts", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    const isSponsor = can(ctx.roles, "tuition", "readReceipts");
+    const isStudent = can(ctx.roles, "tuition", "pay");
+    if (!isSponsor && !isStudent && !isAdminTier(ctx.roles)) {
+      throw new ApiError(403, "Forbidden: requires tuition:pay or tuition:readReceipts");
+    }
+    const viewerRole = isAdminTier(ctx.roles) ? "compliance_admin" : isSponsor ? "sponsor" : "student";
+    const rows = await listReceipts(db, { userId: ctx.session.user.id, role: viewerRole });
+    return c.json({ receipts: rows });
+  });
+
+  // T12: student views their own R_score (RLS-scoped to owner).
+  app.get("/api/credit/score", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "credit", "readScore");
+    const score = await getLatestScore(db, ctx.session.user.id);
+    return c.json({ score });
+  });
+
+  // T13: Metro-2 export — compliance tier + MFA enrollment required (no bypass).
+  app.post("/api/admin/metro2/export", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "credit", "exportMetro2");
+    requireMfaEnrolled(ctx.session.user);
+    const body = await c.req.json();
+    const ring = loadKeyringFromEnv(); // KMS-injected keys; decrypted only in the enclave
+    const exportResult = await generateMetro2Export(db, ring, {
+      studentUserId: required(body.studentUserId, "studentUserId"),
+      actorUserId: ctx.session.user.id,
+    });
+    return c.json({ export: exportResult });
+  });
+
   app.onError((err, c) => {
     if (err instanceof ApiError) {
       return c.json({ error: err.message }, err.status);
@@ -198,6 +266,10 @@ export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
     if (err instanceof LedgerError) {
       // Ledger/business-rule rejections (insufficient funds, caps, screening,
       // bad lock, unbalanced) are client-correctable: surface as 400 with code.
+      return c.json({ error: err.message, code: err.code }, 400);
+    }
+    if (err instanceof TuitionError) {
+      // Tuition routing rejections (unverified institution, bad wallet, etc.).
       return c.json({ error: err.message, code: err.code }, 400);
     }
     console.error("unhandled error", err);

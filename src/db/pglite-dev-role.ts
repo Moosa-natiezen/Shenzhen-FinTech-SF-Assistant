@@ -30,6 +30,12 @@ const APP_TABLES = [
   "balance_snapshots",
   "rate_locks",
   "transfers",
+  // Phase-3 tuition + credit tables: FORCE-RLS + append-only receipts/scores.
+  "universities",
+  "sponsor_links",
+  "tuition_payments",
+  "credit_profiles",
+  "r_score_snapshots",
 ];
 
 export async function asAppRole(db: AnyPgDatabase, roleName = "sf_app"): Promise<void> {
