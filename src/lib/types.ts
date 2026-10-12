@@ -109,3 +109,17 @@ export interface FundingSource {
   kind: string;
   balance: string;
 }
+
+export interface FlaggedTransfer {
+  id: string;
+  occurredAt: string;
+  senderUserId: string;
+  recipientUserId: string | null;
+  fromCurrency: string;
+  toCurrency: string;
+  amountFrom: string;
+  kind: string;
+  status: string;
+  screeningReason: string | null;
+  flags: string[];
+}

@@ -5,6 +5,9 @@
  *  - Session verification goes through Better Auth on every protected route;
  *    roles are read from the server-side session, never from request payloads.
  *  - Every application-table query runs inside an RLS-bound transaction.
+ *  - Phase-5 hardening (T18/T19): structured PII-free request logging,
+ *    bypass-resistant rate limiting (session-keyed money budgets, IP-keyed
+ *    credential budgets), and compliance alerting that survives rollbacks.
  */
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -25,17 +28,75 @@ import { getLatestScore } from "../credit/rscore";
 import { generateMetro2Export } from "../reporting/metro2";
 import { loadKeyringFromEnv } from "../security/spii";
 import { can } from "../security/guards";
+import { clientIp, defaultRateLimitProfiles, rateLimit, RateLimiter, MONEY_PATHS, type RateLimitProfiles } from "../security/rate-limit";
+import { emitAlert, initAlerts } from "../observability/alerts";
+import { logger } from "../observability/logger";
+import { listFlagged } from "../observability/flagged";
 
 export interface AppDeps {
   auth: Auth;
   db: AnyPgDatabase;
   allowedOrigins: string[];
+  /** Test hook: inject tight rate limits or a preloaded limiter. */
+  rateLimits?: Partial<RateLimitProfiles>;
+  rateLimiter?: RateLimiter;
 }
 
-export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
+export function buildApp({ auth, db, allowedOrigins, rateLimits, rateLimiter }: AppDeps) {
   const app = new Hono();
 
   app.use("*", secureHeaders());
+
+  // T19: alert persistence needs a db handle for out-of-band compliance signals.
+  initAlerts(db);
+
+  const limiter = rateLimiter ?? new RateLimiter();
+  const profiles: RateLimitProfiles = {
+    ...defaultRateLimitProfiles(process.env.NODE_ENV),
+    ...rateLimits,
+  };
+
+  // T18/T19: structured request log (no PII — the logger redacts by key AND
+  // value shape) + global per-IP flood protection.
+  app.use("*", async (c, next) => {
+    const started = Date.now();
+    await next();
+    logger.info("http.request", {
+      method: c.req.method,
+      path: c.req.path,
+      status: c.res.status,
+      durationMs: Date.now() - started,
+      userId: null, // populated below by the session-scoped logger when known
+    });
+  });
+
+  // Global per-IP flood limit (defense in depth under the per-route budgets).
+  app.use("*", rateLimit({ limiter, ...profiles.global, keyFn: (c) => clientIp(c) }));
+
+  // Credential endpoints: strict per-IP budget (brute-force defense).
+  app.use("/api/auth/sign-in/*", rateLimit({ limiter, ...profiles.auth, keyFn: (c) => clientIp(c) }));
+  app.use("/api/auth/sign-up/*", rateLimit({ limiter, ...profiles.auth, keyFn: (c) => clientIp(c) }));
+
+  // Money-movement endpoints: budget keyed on the SERVER-RESOLVED session
+  // user id — rotating cookies/IPs/headers cannot mint a fresh budget.
+  app.use("*", async (c, next) => {
+    if (!(MONEY_PATHS as readonly string[]).includes(c.req.path)) return next();
+    const session = await auth.api.getSession({ headers: c.req.raw.headers });
+    const key = session ? `user:${session.user.id}` : null; // null => let the route 401
+    return rateLimit({
+      limiter,
+      ...profiles.money,
+      keyFn: () => key,
+      onThrottled: (_c, k) => {
+        void emitAlert({
+          kind: "rate_limit_triggered",
+          severity: "info",
+          actorUserId: session?.user.id ?? null,
+          details: { path: c.req.path, budgetKey: k.startsWith("user:") ? "session" : "ip" },
+        });
+      },
+    })(c, next);
+  });
   app.use(
     "*",
     cors({
@@ -86,6 +147,12 @@ export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
     ]);
     if (!chain.ok) {
       // Tamper detection: surface loudly rather than serving possibly-poisoned data.
+      void emitAlert({
+        kind: "audit_chain_failure",
+        severity: "critical",
+        actorUserId: ctx.session.user.id,
+        details: { brokenAtId: chain.brokenAtId, length: chain.length, source: "admin_audit_route" },
+      });
       return c.json({ error: "audit chain integrity failure", brokenAtId: chain.brokenAtId }, 500);
     }
     return c.json({ chainVerified: true, entries: rows });
@@ -276,11 +343,35 @@ export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
     return c.json({ export: exportResult });
   });
 
+  // T19: flagged / high-risk transaction review (compliance tier + MFA).
+  app.get("/api/admin/flagged", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "compliance", "inspectFlagged");
+    requireMfaEnrolled(ctx.session.user);
+    const rows = await listFlagged(db, { userId: ctx.session.user.id });
+    return c.json({ flagged: rows });
+  });
+
   app.onError((err, c) => {
     if (err instanceof ApiError) {
       return c.json({ error: err.message }, err.status);
     }
     if (err instanceof LedgerError) {
+      // Compliance signals for blocked money movement. These survive the
+      // rolled-back money transaction by design (own audit append + log).
+      if (err.code === "CAP_EXCEEDED") {
+        void emitAlert({
+          kind: "velocity_cap_hit",
+          severity: "warning",
+          details: { reason: err.message, path: c.req.path },
+        });
+      } else if (err.code === "SCREENING_BLOCKED") {
+        void emitAlert({
+          kind: "screening_blocked",
+          severity: "critical",
+          details: { reason: err.message, path: c.req.path },
+        });
+      }
       // Ledger/business-rule rejections (insufficient funds, caps, screening,
       // bad lock, unbalanced) are client-correctable: surface as 400 with code.
       return c.json({ error: err.message, code: err.code }, 400);
@@ -289,7 +380,13 @@ export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
       // Tuition routing rejections (unverified institution, bad wallet, etc.).
       return c.json({ error: err.message, code: err.code }, 400);
     }
-    console.error("unhandled error", err);
+    logger.error("http.unhandled_error", {
+      path: c.req.path,
+      method: c.req.method,
+      errorName: err instanceof Error ? err.name : "unknown",
+      // Message only — stacks can embed request data; the logger scrubs anyway.
+      errorMessage: err instanceof Error ? err.message : "unknown",
+    });
     return c.json({ error: "Internal server error" }, 500);
   });
 

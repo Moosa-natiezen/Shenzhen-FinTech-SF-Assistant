@@ -4,6 +4,7 @@
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { LockIcon } from "@/components/LockIcon";
+import { FlaggedList } from "@/components/FlaggedList";
 import type { Metro2Export } from "@/lib/types";
 
 export default function AdminPage() {
@@ -40,6 +41,7 @@ export default function AdminPage() {
           {busy ? "Generating…" : "Generate export"}
         </button>
       </form>
+      <FlaggedList />
       {result && (
         <div className="transparency" style={{ marginTop: 14 }}>
           <div className="line">

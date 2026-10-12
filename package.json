@@ -16,7 +16,10 @@
     "dev:web": "next dev",
     "build:web": "next build",
     "typecheck:backend": "tsc --noEmit -p tsconfig.backend.json",
-    "typecheck:web": "tsc --noEmit"
+    "typecheck:web": "tsc --noEmit",
+    "rehearse:staging": "tsx scripts/staging-rehearsal.ts",
+    "verify:tls": "tsx scripts/verify-tls.ts",
+    "audit:monitor": "tsx scripts/audit-monitor.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.11",

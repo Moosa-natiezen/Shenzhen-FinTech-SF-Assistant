@@ -10,6 +10,7 @@ import { createAuth } from "../auth";
 import { loadEnv } from "../config/env";
 import { asAppRole } from "../db/pglite-dev-role";
 import { buildApp } from "./app";
+import { startAuditChainMonitor } from "../observability/audit-monitor";
 
 const env = loadEnv();
 const pg = new PGlite();
@@ -23,6 +24,9 @@ const app = buildApp({
   allowedOrigins: env.ALLOWED_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean),
 });
 const port = Number(process.env.PORT ?? 3000);
+// T18: periodic audit-chain integrity verification (dev: every 5 minutes).
+const monitor = startAuditChainMonitor(db, 5 * 60 * 1000);
 serve({ fetch: app.fetch, port }, () => {
   console.log(`[dev] PGlite-backed sf-assistant gateway on http://localhost:${port}`);
 });
+process.on("SIGTERM", () => { monitor.stop(); process.exit(0); });

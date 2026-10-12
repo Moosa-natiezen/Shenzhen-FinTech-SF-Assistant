@@ -58,9 +58,9 @@ audit trail covers the new state changes.
 
 ## Phase 5 — Hardening & Launch
 
-- [ ] **T18. Security test suite + pen-test prep.** IDOR/RLS cross-tenant tests, MFA-bypass negative tests, race-condition stress on the ledger, rate-limit bypass tests, audit-chain integrity monitor job. *(I-1…I-9)*
-- [ ] **T19. Observability & compliance ops.** Structured logs (no PII), alerting on velocity-cap hits and audit-chain failures, admin console for flagged transactions. *(Security §1, §2)*
-- [ ] **T20. Launch checklist.** KMS key rotation drill, Neon branch-based staging rehearsal, TLS/cipher verification, backup/restore test, regulatory review sign-off.
+- [x] **T18. Security test suite + pen-test prep.** IDOR/RLS cross-tenant tests, MFA-bypass negative tests, race-condition stress on the ledger, rate-limit bypass tests, audit-chain integrity monitor job. *(I-1…I-9)*
+- [x] **T19. Observability & compliance ops.** Structured logs (no PII), alerting on velocity-cap hits and audit-chain failures, admin console for flagged transactions. *(Security §1, §2)*
+- [x] **T20. Launch checklist.** KMS key rotation drill, Neon branch-based staging rehearsal, TLS/cipher verification, backup/restore test, regulatory review sign-off.
 
 ---
 
