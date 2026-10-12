@@ -330,3 +330,43 @@ describe("Phase-3 money/credit endpoints: RBAC + MFA + no-plaintext SPII", () =>
     expect(raw).not.toContain(ciphertext);
   });
 });
+
+describe("Phase-4 sponsor funding source (T17)", () => {
+  beforeAll(async () => {
+    // Provision the sponsor's own funding wallet (onboarding does this in prod).
+    const [parentRow] = await db.select().from(user).where(eq(user.email, "parent@family.example.com"));
+    await withUserContext(db, { userId: parentRow!.id, role: "student" }, (tx) =>
+      tx.insert(wallets).values({ id: "w-parent-cny", userId: parentRow!.id, currency: "CNY", kind: "home", balance: "2500" }).onConflictDoNothing(),
+    );
+  });
+
+  it("sponsor can read OWN funding-source details (funding:readSourceDetails), scoped to self", async () => {
+    const { cookies } = await signIn("parent@family.example.com");
+    const res = await app.request("/api/funding/source", { headers: { cookie: cookies, origin: "http://localhost:3000" } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { wallets: Array<{ id: string; currency: string }> };
+    // Only the sponsor's own wallet — never another user's (I-1).
+    expect(body.wallets.map((w) => w.id)).toEqual(["w-parent-cny"]);
+    expect(body.wallets[0]!.currency).toBe("CNY");
+  });
+
+  it("student tier is denied funding-source details (403, requires funding:readSourceDetails)", async () => {
+    const { cookies } = await signIn("alice@students.example.com");
+    const res = await app.request("/api/funding/source", { headers: { cookie: cookies, origin: "http://localhost:3000" } });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/funding:readSourceDetails/);
+  });
+
+  it("sponsor with the returned wallet can deposit via /api/funding/deposit (funding flow)", async () => {
+    const { cookies } = await signIn("parent@family.example.com");
+    const res = await app.request("/api/funding/deposit", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: cookies, origin: "http://localhost:3000" },
+      body: JSON.stringify({ walletId: "w-parent-cny", amount: "100" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { deposit: { walletBalance: string } };
+    expect(body.deposit.walletBalance).toBe("2600.00000000"); // exact 8dp money format
+  });
+});

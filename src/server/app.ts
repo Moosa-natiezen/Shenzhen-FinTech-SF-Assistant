@@ -245,6 +245,23 @@ export function buildApp({ auth, db, allowedOrigins }: AppDeps) {
     return c.json({ score });
   });
 
+  // T17: sponsor funding source — the sponsor's OWN wallets (funding tier only,
+  // via funding:readSourceDetails). Sponsors are denied the general wallet:read,
+  // but must learn their own funding source to initiate a deposit (I-1).
+  app.get("/api/funding/source", async (c) => {
+    const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
+    requirePermission(ctx.roles, "funding", "readSourceDetails");
+    const rows = await withUserContext(
+      db,
+      { userId: ctx.session.user.id, role: "student" },
+      (tx) =>
+        tx
+          .select({ id: wallets.id, currency: wallets.currency, kind: wallets.kind, balance: wallets.balance })
+          .from(wallets),
+    );
+    return c.json({ wallets: rows });
+  });
+
   // T13: Metro-2 export — compliance tier + MFA enrollment required (no bypass).
   app.post("/api/admin/metro2/export", async (c) => {
     const ctx = await getSessionOrThrow(auth, c.req.raw.headers);
