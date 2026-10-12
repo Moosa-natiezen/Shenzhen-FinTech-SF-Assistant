@@ -236,5 +236,5 @@ plan with security invariants (I-1…I-10) and Definition of Done per task.
 - ✅ **Phase 1 — Foundation & Security Backbone** (complete)
 - ✅ **Phase 2 — Multi-Currency Wallet & Ledger Engine** (complete)
 - ✅ **Phase 3 — Tuition Routing & Credit Engine** (complete)
-- ⬜ Phase 4 — Web Portal
+- ✅ **Phase 4 — Web Portal** (complete)
 - ⬜ Phase 5 — Hardening & Launch
